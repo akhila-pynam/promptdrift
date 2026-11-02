@@ -130,6 +130,10 @@ def monitor_suite(config: Config, config_path: Path, *, samples: int = 3) -> Mon
         old = baseline.tests.get(test.id)
         failures = behavioral_failures = errors = changes = warnings = 0
         signals: set[str] = set()
+        observed_output_hash: str | None = None
+        observed_assertions: dict[str, bool] = {}
+        observed_metrics: dict[str, float | int | None] = {}
+        observed_provenance: Provenance | None = None
         for _ in range(samples):
             try:
                 response = provider.complete(
@@ -150,9 +154,20 @@ def monitor_suite(config: Config, config_path: Path, *, samples: int = 3) -> Mon
                 and assertion.type not in OPERATIONAL_ASSERTIONS
                 for assertion, result in zip(test.assertions, evaluations, strict=False)
             ) or (test.output.format == "json" and not evaluations[len(test.assertions)].passed)
+            observed = with_response(provenance, response)
+            observed_output_hash = hashlib.sha256(response.output.encode()).hexdigest()
+            observed_assertions = {
+                evaluation.assertion: evaluation.passed for evaluation in evaluations
+            }
+            observed_metrics = {
+                "latency_ms": response.latency_ms,
+                "input_tokens": response.input_tokens,
+                "output_tokens": response.output_tokens,
+                "estimated_cost_usd": response.estimated_cost_usd,
+            }
+            observed_provenance = observed
             if old:
-                changes += hashlib.sha256(response.output.encode()).hexdigest() != old.output_hash
-                observed = with_response(provenance, response)
+                changes += observed_output_hash != old.output_hash
                 if old.provenance:
                     for field in ("response_model_hash", "system_fingerprint_hash"):
                         before, after = getattr(old.provenance, field), getattr(observed, field)
@@ -204,6 +219,10 @@ def monitor_suite(config: Config, config_path: Path, *, samples: int = 3) -> Mon
                 provider_errors=errors,
                 output_changes=changes,
                 evidence=evidence,
+                output_hash=observed_output_hash,
+                assertions=observed_assertions,
+                metrics=observed_metrics,
+                provenance=observed_provenance,
             )
         )
     for missing in sorted(set(baseline.tests) - {test.id for test in active.tests}):

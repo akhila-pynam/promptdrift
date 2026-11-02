@@ -155,3 +155,27 @@ def load_monitor_history(path: Path, *, limit: int = 20) -> list[dict]:
         return [json.loads(row[0]) for row in rows]
     except (OSError, sqlite3.Error, ValueError) as exc:
         raise _history_read_error(exc) from exc
+
+
+def load_monitor_run_by_id(path: Path, run_id: str) -> MonitorReport:
+    """Retrieve a specific monitoring report by its run_id."""
+    if not path.exists():
+        raise PromptDriftError(f"Monitoring history database not found: {path}")
+    try:
+        with closing(
+            sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=5)
+        ) as db:
+            _validate_history_schema(db)
+            row = db.execute(
+                "SELECT report_json FROM monitor_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        if row is None:
+            raise PromptDriftError(f"Monitoring run '{run_id}' not found in history.")
+        data = json.loads(row[0])
+        data.pop("counts", None)
+        data.pop("diagnosis_counts", None)
+        return MonitorReport.model_validate(data)
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        if isinstance(exc, PromptDriftError):
+            raise
+        raise _history_read_error(exc) from exc

@@ -344,6 +344,12 @@ def accept(
     accept_regressions: Annotated[
         bool, typer.Option("--accept-regressions", help="Accept REGRESSED scenarios.")
     ] = False,
+    run_id: Annotated[
+        str | None,
+        typer.Option(
+            "--run-id", help="Promote a reviewed run from monitoring history to baseline."
+        ),
+    ] = None,
     force: Annotated[
         bool, typer.Option(help="Overwrite existing baseline without confirmation.")
     ] = False,
@@ -353,7 +359,7 @@ def accept(
     """Accept current behavior as the new canonical baseline."""
     try:
         from promptdrift.config import load_config
-        from promptdrift.engine.accept import selective_accept
+        from promptdrift.engine.accept import accept_from_history, selective_accept
         from promptdrift.engine.baseline import load_baseline
         from promptdrift.engine.baseline_history import archive_baseline
         from promptdrift.engine.check import orchestrate_check
@@ -369,7 +375,16 @@ def accept(
                 console.print("[yellow]Aborted.[/]")
                 return
 
-        if not path.exists():
+        if run_id:
+            accept_from_history(
+                loaded,
+                config_path,
+                run_id=run_id,
+                scenario_ids=scenario if scenario else None,
+                accept_regressions=accept_regressions,
+                force=True,
+            )
+        elif not path.exists():
             if scenario or changed:
                 raise BaselineError(
                     "Selective acceptance requires an existing baseline. Create a full reviewed baseline first."
@@ -408,9 +423,15 @@ def accept(
             atomic_write(path, content)
 
         if json_output:
-            typer.echo(json.dumps({"baseline": str(path), "status": "accepted"}, indent=2))
+            payload = {"baseline": str(path), "status": "accepted"}
+            if run_id:
+                payload["promoted_run_id"] = run_id
+            typer.echo(json.dumps(payload, indent=2))
         else:
-            console.print(f"[green]Accepted new baseline:[/] {path}")
+            if run_id:
+                console.print(f"[green]Accepted new baseline from history run {run_id}:[/] {path}")
+            else:
+                console.print(f"[green]Accepted new baseline:[/] {path}")
     except PromptDriftError as error:
         _exit_error(error, verbose)
 
