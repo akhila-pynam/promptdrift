@@ -125,9 +125,12 @@ def accept_from_history(
     report = load_monitor_run_by_id(hist_file, run_id)
 
     baseline_path = config.resolve_path(config_path, config.baseline.path)
+    if baseline_path.exists() and not force:
+        raise BaselineError(f"Baseline already exists: {baseline_path}. Use --force to replace it.")
 
     active, _ = resolve_suite(config, config_path)
     active_test_ids = {t.id for t in active.tests}
+    active_tests_by_id = {t.id: t for t in active.tests}
     report_cases_by_id = {c.test_id: c for c in report.tests}
 
     if scenario_ids:
@@ -151,12 +154,31 @@ def accept_from_history(
         target_ids = [t.id for t in active.tests]
 
     failing_cases: list[str] = []
+    from promptdrift.engine.provenance import fingerprint
+    from promptdrift.templates import render_prompt
+
     for test_id in target_ids:
+        test = active_tests_by_id[test_id]
         case = report_cases_by_id[test_id]
         if case.output_hash is None:
             raise BaselineError(
                 f"Case '{test_id}' in history run '{run_id}' has no observed output hash to promote."
             )
+        if case.provenance is not None:
+            prompt_str = render_prompt(
+                active.resolve_path(config_path, test.prompt), test.variables
+            )
+            current_prov = fingerprint(active, test, prompt_str)
+            if (
+                case.provenance.input_hash != current_prov.input_hash
+                or case.provenance.configuration_hash != current_prov.configuration_hash
+                or case.provenance.contract_hash != current_prov.contract_hash
+                or case.provenance.provider_hash != current_prov.provider_hash
+            ):
+                raise BaselineError(
+                    f"Case '{test_id}' in history run '{run_id}' has mismatched provenance with current test configuration. "
+                    "The prompt, configuration, contracts, or provider have changed since this run was recorded."
+                )
         if case.status in ("FAIL", "ERROR") or case.failures > 0 or case.provider_errors > 0:
             failing_cases.append(test_id)
 

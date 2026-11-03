@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -11,7 +12,7 @@ from typer.testing import CliRunner
 
 from promptdrift.cli import app
 from promptdrift.engine.baseline import load_baseline
-from promptdrift.errors import PromptDriftError
+from promptdrift.errors import BaselineError, PromptDriftError
 from promptdrift.models import Config
 from promptdrift.models.baseline import Baseline
 from promptdrift.models.monitor import Diagnosis, MonitorCase, MonitorReport
@@ -59,15 +60,31 @@ def _create_sample_monitor_report(
     diagnosis: Diagnosis = "stable",
     failures: int = 0,
     output_hash: str | None = None,
+    config: Config | None = None,
+    config_path: Path | None = None,
 ) -> MonitorReport:
     out_hash = output_hash or hashlib.sha256(b"Hello, World!").hexdigest()
-    prov = Provenance(
-        input_hash="hash_in",
-        provider_hash="hash_prov",
-        configuration_hash="hash_cfg",
-        contract_hash="hash_contract",
-        engine_version="0.4.0",
-    )
+    if config is not None and config_path is not None:
+        from promptdrift.engine.provenance import fingerprint
+        from promptdrift.engine.suite import resolve_suite
+        from promptdrift.templates import render_prompt
+
+        active, _ = resolve_suite(config, config_path)
+        prov_map = {}
+        for t in active.tests:
+            p_text = render_prompt(active.resolve_path(config_path, t.prompt), t.variables)
+            prov_map[t.id] = fingerprint(active, t, p_text)
+        prov_greeting = prov_map.get("greeting")
+        prov_farewell = prov_map.get("farewell")
+    else:
+        prov_greeting = prov_farewell = Provenance(
+            input_hash="hash_in",
+            provider_hash="hash_prov",
+            configuration_hash="hash_cfg",
+            contract_hash="hash_contract",
+            engine_version="0.4.0",
+        )
+
     cases = [
         MonitorCase(
             test_id="greeting",
@@ -79,7 +96,7 @@ def _create_sample_monitor_report(
             output_hash=out_hash,
             assertions={"contains": True},
             metrics={"latency_ms": 15.0, "input_tokens": 5, "output_tokens": 4},
-            provenance=prov,
+            provenance=prov_greeting,
         ),
         MonitorCase(
             test_id="farewell",
@@ -91,7 +108,7 @@ def _create_sample_monitor_report(
             output_hash=hashlib.sha256(b"Goodbye, World!").hexdigest(),
             assertions={"contains": True},
             metrics={"latency_ms": 12.0, "input_tokens": 5, "output_tokens": 4},
-            provenance=prov,
+            provenance=prov_farewell,
         ),
     ]
     return MonitorReport(
@@ -135,13 +152,28 @@ class TestLoadMonitorRunById:
         with pytest.raises(PromptDriftError, match="corrupted"):
             load_monitor_run_by_id(db_path, "run-1")
 
+    def test_corrupt_non_dict_json_raises_error(self, tmp_path):
+        db_path = tmp_path / "history.sqlite3"
+        with sqlite3.connect(db_path) as db:
+            db.execute(
+                "CREATE TABLE monitor_runs (run_id TEXT PRIMARY KEY, report_json TEXT NOT NULL)"
+            )
+            db.execute("PRAGMA user_version = 1")
+            db.execute("INSERT INTO monitor_runs VALUES (?, ?)", ("corrupt-1", "[1, 2, 3]"))
+            db.commit()
+
+        with pytest.raises(PromptDriftError, match="corrupted"):
+            load_monitor_run_by_id(db_path, "corrupt-1")
+
 
 class TestAcceptFromHistory:
     def test_accept_run_id_creates_baseline_without_provider_calls(self, test_project, monkeypatch):
-        _, config_file = test_project
+        config, config_file = test_project
         hist_file = history_path(config_file)
         run_id = "reviewed-run-001"
-        report = _create_sample_monitor_report(run_id=run_id)
+        report = _create_sample_monitor_report(
+            run_id=run_id, config=config, config_path=config_file
+        )
         save_monitor_report(report, hist_file)
 
         # Mock MockProvider.complete to assert no provider calls happen
@@ -168,10 +200,13 @@ class TestAcceptFromHistory:
         assert baseline.tests["greeting"].metadata.get("promoted_from_run_id") == run_id
 
     def test_accept_run_id_json_output(self, test_project):
-        _, config_file = test_project
+        config, config_file = test_project
         hist_file = history_path(config_file)
         run_id = "reviewed-run-json"
-        save_monitor_report(_create_sample_monitor_report(run_id=run_id), hist_file)
+        save_monitor_report(
+            _create_sample_monitor_report(run_id=run_id, config=config, config_path=config_file),
+            hist_file,
+        )
 
         runner = CliRunner()
         result = runner.invoke(
@@ -225,12 +260,17 @@ class TestAcceptFromHistory:
         assert "incompatible" in result.output.lower() or "missing" in result.output.lower()
 
     def test_accept_run_id_failing_case_requires_accept_regressions(self, test_project):
-        _, config_file = test_project
+        config, config_file = test_project
         hist_file = history_path(config_file)
         run_id = "failing-run"
 
         failing_report = _create_sample_monitor_report(
-            run_id=run_id, status="FAIL", diagnosis="observed_model_drift", failures=1
+            run_id=run_id,
+            status="FAIL",
+            diagnosis="observed_model_drift",
+            failures=1,
+            config=config,
+            config_path=config_file,
         )
         save_monitor_report(failing_report, hist_file)
 
@@ -261,10 +301,12 @@ class TestAcceptFromHistory:
         assert baseline.tests["greeting"].status == "FAIL"
 
     def test_accept_run_id_selective_scenario(self, test_project):
-        _, config_file = test_project
+        config, config_file = test_project
         hist_file = history_path(config_file)
         run_id = "selective-run"
-        report = _create_sample_monitor_report(run_id=run_id)
+        report = _create_sample_monitor_report(
+            run_id=run_id, config=config, config_path=config_file
+        )
         save_monitor_report(report, hist_file)
 
         # First, create an initial baseline with old hashes
@@ -317,10 +359,13 @@ class TestAcceptFromHistory:
         assert updated_baseline.tests["farewell"].output_hash == "old_farewell_hash"
 
     def test_accept_run_id_archives_existing_baseline(self, test_project):
-        _, config_file = test_project
+        config, config_file = test_project
         hist_file = history_path(config_file)
         run_id = "archive-run"
-        save_monitor_report(_create_sample_monitor_report(run_id=run_id), hist_file)
+        save_monitor_report(
+            _create_sample_monitor_report(run_id=run_id, config=config, config_path=config_file),
+            hist_file,
+        )
 
         baseline_file = config_file.parent / "promptdrift.baseline.json"
         baseline_file.write_text(
@@ -339,10 +384,16 @@ class TestAcceptFromHistory:
         assert len(archived_files) == 1
 
     def test_accept_run_id_does_not_leak_raw_prompts_or_secrets(self, test_project):
-        _, config_file = test_project
+        config, config_file = test_project
         hist_file = history_path(config_file)
         run_id = "no-leak-run"
-        save_monitor_report(_create_sample_monitor_report(run_id=run_id), hist_file)
+        report = _create_sample_monitor_report(
+            run_id=run_id, config=config, config_path=config_file
+        )
+        report.tests[0] = report.tests[0].model_copy(
+            update={"summary": "secret summary", "evidence": ["secret evidence"]}
+        )
+        save_monitor_report(report, hist_file)
 
         runner = CliRunner()
         runner.invoke(app, ["accept", "-c", str(config_file), "--run-id", run_id, "--force"])
@@ -352,3 +403,58 @@ class TestAcceptFromHistory:
         assert "Hello, World!" not in raw_content
         assert "Goodbye, World!" not in raw_content
         assert "secret" not in raw_content.lower()
+
+    def test_accept_run_id_rejects_changed_flag(self, test_project):
+        config, config_file = test_project
+        hist_file = history_path(config_file)
+        run_id = "test-changed-run"
+        save_monitor_report(
+            _create_sample_monitor_report(run_id=run_id, config=config, config_path=config_file),
+            hist_file,
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            app, ["accept", "-c", str(config_file), "--run-id", run_id, "--changed", "--force"]
+        )
+        assert result.exit_code != 0
+        assert "--changed cannot be combined with --run-id" in result.output
+
+    def test_accept_run_id_rejects_without_force_when_baseline_exists(self, test_project):
+        config, config_file = test_project
+        hist_file = history_path(config_file)
+        run_id = "test-force-run"
+        save_monitor_report(
+            _create_sample_monitor_report(run_id=run_id, config=config, config_path=config_file),
+            hist_file,
+        )
+
+        baseline_file = config_file.parent / "promptdrift.baseline.json"
+        baseline_file.write_text(
+            '{"schema_version": 3, "promptdrift_version": "0.4.0", "generated_at": "2026-01-01T00:00:00Z", "provider": {"type": "mock", "model": "m"}, "tests": {}}\n'
+        )
+
+        from promptdrift.engine.accept import accept_from_history
+
+        with pytest.raises(BaselineError, match="Use --force to replace it"):
+            accept_from_history(config, config_file, run_id=run_id, force=False)
+
+    def test_accept_run_id_rejects_mismatched_provenance(self, test_project):
+        config, config_file = test_project
+        hist_file = history_path(config_file)
+        run_id = "mismatched-prov-run"
+        save_monitor_report(
+            _create_sample_monitor_report(run_id=run_id, config=config, config_path=config_file),
+            hist_file,
+        )
+
+        # Modify the prompt file after monitoring was recorded
+        prompt_file = config_file.parent / "prompts" / "greeting.txt"
+        prompt_file.write_text("Modified greeting: {{ name }}", encoding="utf-8")
+
+        runner = CliRunner()
+        result = runner.invoke(
+            app, ["accept", "-c", str(config_file), "--run-id", run_id, "--force"]
+        )
+        assert result.exit_code != 0
+        assert "mismatched" in result.output and "provenance" in result.output

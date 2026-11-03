@@ -376,6 +376,10 @@ def accept(
                 return
 
         if run_id:
+            if changed:
+                raise BaselineError(
+                    "--changed cannot be combined with --run-id. Use --scenario to select cases."
+                )
             accept_from_history(
                 loaded,
                 config_path,

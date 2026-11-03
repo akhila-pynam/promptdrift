@@ -172,6 +172,11 @@ def load_monitor_run_by_id(path: Path, run_id: str) -> MonitorReport:
         if row is None:
             raise PromptDriftError(f"Monitoring run '{run_id}' not found in history.")
         data = json.loads(row[0])
+        if not isinstance(data, dict):
+            raise PromptDriftError(
+                f"Monitoring run '{run_id}' is corrupted; back up the database, "
+                "then remove the run or the database."
+            )
         data.pop("counts", None)
         data.pop("diagnosis_counts", None)
         return MonitorReport.model_validate(data)
